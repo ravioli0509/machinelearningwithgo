@@ -1,141 +1,181 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
-	"os"
 	"net/http"
+	"os"
+	"sort"
 
-	tf "github.com/tensorflow/tensorflow/tensorflow/go"
+	"github.com/tensorflow/tensorflow/tensorflow/go"
+	"github.com/tensorflow/tensorflow/tensorflow/go/op"
 )
 
-var (
-	graphFile ="/model/tensorflow_inception_graph.pb"
+const (
+	graphFile  = "/model/tensorflow_inception_graph.pb"
 	labelsFile = "/model/imagenet_comp_graph_label_strings.txt"
 )
 
-func main() {
-	if len(os.Args) < 2 {
-		log.Fatalf("usage: ingrecognition <img_url>")
-	}
-	fmt.Printf("url: %s", os.Args[1])
+// Label type
+type Label struct {
+	Label       string  `json:"label"`
+	Probability float32 `json:"probability"`
+}
 
-	response, error := http.Get(os.Args[1])
-	if error != nil {
-		log.Fatalf("unable to get the image: %v", error)
+// Labels type
+type Labels []Label
+
+func (a Labels) Len() int           { return len(a) }
+func (a Labels) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a Labels) Less(i, j int) bool { return a[i].Probability > a[j].Probability }
+
+func main() {
+	os.Setenv("TF_CPP_MIN_LOG_LEVEL", "2")
+
+	if len(os.Args) < 2 {
+		log.Fatalf("usage: imgrecognition <image_url>")
+	}
+	fmt.Printf("url: %s\n", os.Args[1])
+
+	// Get image from URL
+	response, e := http.Get(os.Args[1])
+	if e != nil {
+		log.Fatalf("unable to get image from url: %v", e)
 	}
 	defer response.Body.Close()
 
-	modelGraph, labels, error := loadGraphAndLabels()
-	if error != nil {
-		log.Fatalf("unable to load graph and labels: %v", error)
+	modelGraph, labels, err := loadModel()
+	if err != nil {
+		log.Fatalf("unable to load model: %v", err)
 	}
 
-	sesson, error := tf.NewSession(modelGraph, nil)
-	if error != nil {
-		log.Fatalf("unable to init session: %v", error)
-	}
-	defer session.Close()
-
-	tensor, error := normalizeImage(response.Body)
-	if error != nil {
-		log.Fatalf("unable to normalize image: %v", error)
+	// Get normalized tensor
+	tensor, err := normalizeImage(response.Body)
+	if err != nil {
+		log.Fatalf("unable to make a tensor from image: %v", err)
 	}
 
-	result, error := session.Run(map[tf.Output]*tf.Tensor{
-		modelGraph.Operation("input").Output(0): tensor,
-	},
-	[]tf.Output{
-		modelGraph.Operation("output").Output(0), 
-	}, nil)
-	if error != nil {
-		log.Fatalf("unable to inference: %v", error)
+	// Create a session for inference over modelGraph
+	session, err := tensorflow.NewSession(modelGraph, nil)
+	if err != nil {
+		log.Fatalf("could not init session: %v", err)
 	}
 
+	output, err := session.Run(
+		map[tensorflow.Output]*tensorflow.Tensor{
+			modelGraph.Operation("input").Output(0): tensor,
+		},
+		[]tensorflow.Output{
+			modelGraph.Operation("output").Output(0),
+		},
+		nil)
+	if err != nil {
+		log.Fatalf("could not run inference: %v", err)
+	}
 
-	result[0].Value().([][]float32)[0]
-
+	res := getTopFiveLabels(labels, output[0].Value().([][]float32)[0])
+	for _, l := range res {
+		fmt.Printf("label: %s, probability: %.2f%%\n", l.Label, l.Probability*100)
+	}
 }
 
+func loadModel() (*tensorflow.Graph, []string, error) {
+	// Load inception model
+	model, err := ioutil.ReadFile(graphFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	graph := tensorflow.NewGraph()
+	if err := graph.Import(model, ""); err != nil {
+		return nil, nil, err
+	}
 
+	// Load labels
+	labelsFile, err := os.Open(labelsFile)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer labelsFile.Close()
+	scanner := bufio.NewScanner(labelsFile)
+	var labels []string
+	for scanner.Scan() {
+		labels = append(labels, scanner.Text())
+	}
 
+	return graph, labels, scanner.Err()
+}
 
-func normalizeImage(body io.ReadCloser) (*tf.Tensor, error) {
+func getTopFiveLabels(labels []string, probabilities []float32) []Label {
+	var resultLabels []Label
+	for i, p := range probabilities {
+		if i >= len(labels) {
+			break
+		}
+		resultLabels = append(resultLabels, Label{Label: labels[i], Probability: p})
+	}
+
+	sort.Sort(Labels(resultLabels))
+	return resultLabels[:5]
+}
+
+func normalizeImage(body io.ReadCloser) (*tensorflow.Tensor, error) {
 	var buf bytes.Buffer
 	io.Copy(&buf, body)
 
-
-	tensor, error := tf.NewTensor(buf.String())
-	if error != nil {
-		return nil, error
+	tensor, err := tensorflow.NewTensor(buf.String())
+	if err != nil {
+		return nil, err
 	}
 
-	graph, input, output, error := getNormalizedGraph()
-	if error != nil {
-		return nil, error
+	graph, input, output, err := getNormalizedGraph()
+	if err != nil {
+		return nil, err
 	}
 
-	session ,error := tf.NewSession(graph, nil)
-	if error != nil {
-		return nil, error
+	session, err := tensorflow.NewSession(graph, nil)
+	if err != nil {
+		return nil, err
 	}
-	defer session
 
-	session.Run(map[tf.Output]*tf.Tensor{
-		input: t,
-	},
-	[]tf.Output{
-		output, 
-	}, nil)
-	if error != nil {
-		return nil, error
+	normalized, err := session.Run(
+		map[tensorflow.Output]*tensorflow.Tensor{
+			input: tensor,
+		},
+		[]tensorflow.Output{
+			output,
+		},
+		nil)
+	if err != nil {
+		return nil, err
 	}
 
 	return normalized[0], nil
 }
 
-func getNormalizedGraph() (*tf.Graph, tf.Output, tf.Output, error) {
-	s := os.NewScope() 
-	input := os.Placeholder(s, tf.String)
+// Creates a graph to decode, rezise and normalize an image
+func getNormalizedGraph() (graph *tensorflow.Graph, input, output tensorflow.Output, err error) {
+	s := op.NewScope()
+	input = op.Placeholder(s, tensorflow.String)
+	// 3 return RGB image
 	decode := op.DecodeJpeg(s, input, op.DecodeJpegChannels(3))
 
-	output := op.Sub(s, 
+	// Sub: returns x - y element-wise
+	output = op.Sub(s,
+		// make it 224x224: inception specific
 		op.ResizeBilinear(s,
+			// inserts a dimension of 1 into a tensor's shape.
 			op.ExpandDims(s,
-				op.Cast(s, decode, tf.Float),
+				// cast image to float type
+				op.Cast(s, decode, tensorflow.Float),
 				op.Const(s.SubScope("make_batch"), int32(0))),
 			op.Const(s.SubScope("size"), []int32{224, 224})),
+		// mean = 117: inception specific
 		op.Const(s.SubScope("mean"), float32(117)))
-	graph, error := s.Finalize()
+	graph, err = s.Finalize()
 
-	return graph, input, output, error
-
-}
-
-
-func loadGraphAndLabels() (*tf.Graph, []string, error){
-	model, error := ioutil.ReadFile(graphFile)
-	if error != nil {
-		return nil, nil, error
-	}
-
-	graph := tf.NewGraph()
-	if error = graph.Import(model, ""){
-		return nil, nil, error
-	}
-
-	file, error := os.Open(labelsFile)
-	if error != nil {
-		return nil, nil, error
-	}
-	defer f.Close()
-
-	var labels []string
-	scanner := bufio.NewScanner(labelsFile)
-	for scanner.Scan(){
-		labels = append(labels, scanner.Text())
-	}
-
-	return g, labelsFile, nil
-
+	return graph, input, output, err
 }
